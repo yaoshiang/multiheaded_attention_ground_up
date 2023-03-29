@@ -209,12 +209,13 @@ class ImageTokenizer(tf.keras.layers.Layer):
 
     num_chips = chips.shape[1]
 
-    # BCL (Batch, Chips, token Length)
+    # BCL (Batch, Chips, Embedding Length)
     embedding = self.embedding(chips)
 
-    integer_positions = tf.range(num_chips)  # C
-    integer_positions = integer_positions[..., tf.newaxis]  # C1
-    positional_embedding = self.positional(integer_positions)  # CL
+    positions = tf.range(num_chips, dtype=tf.float32)  # C
+    positions = positions / num_chips  # C
+    positions = positions[..., tf.newaxis]  # C1
+    positional_embedding = self.positional(positions)  # CL
 
     # BCL + CL -> BCL
     return embedding + positional_embedding
@@ -349,6 +350,12 @@ def get_model(model_name, embedding_size=128) -> tf.keras.models.Model:
   x = ImageTokenizer(8, embedding_size)(x)
   for layer in range(6):
     x = MultiHeadedAttention(embedding_size, 6)(x)
+
+  # In a convnet, the penultimate layer is usually a GlobalAveragePooling.
+  # The idea is that the position information is no longer important.
+  # Similarly, we assume that the relative token location is no longer
+  # important.
+  x = tf.reduce_mean(x, axis=2)
   x = tf.keras.layers.Flatten()(x)
   y = tf.keras.layers.Dense(10)(x)
 
