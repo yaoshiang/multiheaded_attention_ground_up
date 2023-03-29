@@ -152,6 +152,10 @@ class ImageTokenizer(tf.keras.layers.Layer):
   def chip_image(image, B, H, W, P):
     """Chops an image into chips.
 
+    TODO: Test a looping implementation. Although this algo is vectorized,
+    it relies on the very expensive transpose operation. It may be
+    faster to loop in code, and allow TF to unroll the loop.
+    
     Args:
       image: A tensor of shape [batch_size, height, width, 3].
       batch_size: An integer.
@@ -165,30 +169,48 @@ class ImageTokenizer(tf.keras.layers.Layer):
     """
     tf.debugging.assert_equal(H, W)
 
-    # Chunk the rows to B, H, W // P, P, 3.
-    image = tf.reshape(image, (-1, H, W // P, P, 3))
+    looping = True
 
-    # Push the rows to the end of the axis. B, W//P, P, H, 3.
-    image = tf.transpose(image, (0, 2, 3, 1, 4))
+    if looping:
+      image = tf.reshape(image, (-1, H, W * 3))
 
-    # Chunk the columns to B, W//P, P, H//P, P, 3.
-    image = tf.reshape(image, (-1, W // P, P, H // P, P, 3))
+      chips = []
+      for row in range(H // P):
+        y_beg = row * P
+        y_end = (row + 1) * P
+        for col in range(W // P):
+          x_beg = col * P * 3
+          x_end = (col + 1) * P * 3
+          chip = image[:, y_beg:y_end, x_beg:x_end]
+          chips.append(tf.reshape(chip, (-1, P * P * 3)))
 
-    # push the chips to the end of the axis. B, W//P, H//P, P, P, 3.
-    image = tf.transpose(image, (0, 3, 1, 4, 2, 5))
+      chips = tf.stack(chips, axis=1)
+      return chips
+    else:
+      # Chunk the rows to B, H, W // P, P, 3.
+      image = tf.reshape(image, (-1, H, W // P, P, 3))
 
-    return image
+      # Push the rows to the end of the axis. B, W//P, P, H, 3.
+      image = tf.transpose(image, (0, 2, 3, 1, 4))
+
+      # Chunk the columns to B, W//P, P, H//P, P, 3.
+      image = tf.reshape(image, (-1, W // P, P, H // P, P, 3))
+
+      # push the chips to the end of the axis. B, W//P, H//P, P, P, 3.
+      image = tf.transpose(image, (0, 3, 1, 4, 2, 5))
+
+      # Flatten the chips. B, H//P x W // P, P x P x 3.
+      image = tf.reshape(image, (-1, H // P * W // P, P * P * 3))
+
+      return image
 
   def call(self, image):
     chips = self.chip_image(image, self.B, self.H, self.W, self.P)
 
-    num_chips = chips.shape[1] * chips.shape[2]
-
-    # Turn the chips into tokens. B, H//P x W // P, P x P x 3.
-    tokens = tf.reshape(image, (-1, num_chips, self.P * self.P * 3))
+    num_chips = chips.shape[1]
 
     # BCL (Batch, Chips, token Length)
-    embedding = self.embedding(tokens)
+    embedding = self.embedding(chips)
 
     integer_positions = tf.range(num_chips)  # C
     integer_positions = integer_positions[..., tf.newaxis]  # C1
@@ -200,13 +222,10 @@ class ImageTokenizer(tf.keras.layers.Layer):
 
 class MultiHeadedAttention(tf.keras.layers.Layer):
 
-  def __init__(self, vector_length, num_heads):
+  def __init__(self, embedding_length, num_heads):
     super().__init__()
-    self.K = tf.keras.layers.Dense(1)
-    self.Q = tf.keras.layers.Dense(1)
-    self.V = tf.keras.layers.Dense(vector_length)
 
-    self.vector_length = vector_length
+    self.embedding_length = embedding_length
     self.num_heads = num_heads
 
     self.layer_norm1 = tf.keras.layers.LayerNormalization()
@@ -215,31 +234,111 @@ class MultiHeadedAttention(tf.keras.layers.Layer):
     self.activation = tfa.layers.GELU()
 
   def build(self, input_shape):
+    if len(input_shape) == 3:
+      # BTE
+      self.token_input = True
+    elif len(input_shape) == 4:
+      # BHTE
+      self.token_input = False
+    else:
+      assert False
+
     self.B = input_shape[0]
     self.T = input_shape[1]
 
+    H = self.num_heads
+    E = self.embedding_length
+    T = self.T
+
+    self.key_kernel = self.add_weight(
+        name='key_kernel',
+        shape=(1, H, E),
+        initializer=tf.keras.initializers.glorot_normal(),
+        trainable=True)
+    self.query_kernel = self.add_weight(
+        name='query_kernel',
+        shape=(1, H, E),
+        initializer=tf.keras.initializers.glorot_normal(),
+        trainable=True)
+    self.value_kernel = self.add_weight(
+        name='value_kernel',
+        shape=(1, H, E, E),
+        initializer=tf.keras.initializers.glorot_normal(),
+        trainable=True)
+    self.ff_kernel = self.add_weight(
+        name='ff_kernel',
+        shape=(1, H, H, E, E),
+        initializer=tf.keras.initializers.glorot_normal(),
+        trainable=True)
+
   @staticmethod
-  def _call(token, K, Q, V, LN1, LN2, A):
-    # Keras dense layers add an extra dimension at the end.
-    key = K(token)[:, :, 0]
-    query = Q(token)[:, :, 0]
-    value = V(token)
+  def _call(
+      embedding,
+      key_kernel,
+      query_kernel,
+      value_kernel,
+      layer_norm1,
+      ff_kernel,
+      layer_norm2,
+      activation,
+  ):
+    """Run multiheaded attention matrix math.
+    
+    B = batch size.
+    T = number of tokens.
+    E = embedding length. 
 
-    kq = tf.einsum('BT, BX -> BTX', query, key)
-    index = tf.nn.softmax(kq, axis=2)
+    Params:
+      token: Tensor of shape BHTE (or BTE if first layer).
+      K: Kernel of shape 1HE
+      Q: Kernel of shape 1HE
+      V: Kernel of shape 1HEE
+      FF: Kernel of shape 1HHE
+    """
+    # BHTE, BHE -> BHT
+    key = tf.einsum('...TE, ...E -> ...T', embedding, key_kernel)
 
-    tf.debugging.assert_near(tf.reduce_sum(index[0, 0]), 1.0)
+    # BHTE, BHE -> BHT
+    query = tf.einsum('...TE, ...E -> ...T', embedding, query_kernel)
 
-    z = tf.einsum('BTX, BXE -> BTE', index, value)
-    z = LN1(z)
-    z = LN2(V(z) + z)
-    z = A(z)
+    # BHTE, BHeE -> BHTE
+    # This is akin to a depthwise conv2D.
+    value = tf.einsum('...TE, ...Ee -> ...Te', embedding, value_kernel)
 
-    return z
+    # Cross product of the keys and queries to generate indices on each value.
+    # BHT, BHt -> BHTt
+    # This is the global information mixing that is unlike any
+    # existing conv structure. Maxpool and atrous convs
+    # are still local in nature, not global.
+    # The cost of globality is this quadratic expansion, the Tt.
+    kq = tf.einsum('...T, ...t -> ...Tt', query, key)
+    index = tf.nn.softmax(kq, axis=3)
 
-  def call(self, token):
-    # Token is shape BTL.
-    z = self._call(token, self.K, self.Q, self.V, self.layer_norm1,
+    tf.debugging.assert_near(tf.reduce_sum(index[0, 0, 0]), 1.0)
+
+    # Mix the global information, indexed with KxQ.
+    # BHTt, BHtE -> BHTE
+    z = tf.einsum('...Tt, ...tE -> ...TE', index, value)
+    z = embedding + z
+    z = layer_norm1(z)
+
+    # Mix the information along the head axis.
+    # This is akin to a 1x1 point conv2D.
+    # BHTE, BTtEe -> BHte
+    y = tf.einsum('...HTE, ...HhEe -> ...hTe', z, ff_kernel)
+    y = z + y
+    y = layer_norm2(activation(y))
+
+    return y
+
+  def call(self, embedding):
+    if self.token_input:
+      # Convert BTE to BHTE, where H is 1 but will be broadcast.
+      embedding = embedding[:, tf.newaxis, :, :]
+
+    # Token is shape BHTL.
+    z = self._call(embedding, self.key_kernel, self.query_kernel,
+                   self.value_kernel, self.layer_norm1, self.ff_kernel,
                    self.layer_norm2, self.activation)
 
     return z
@@ -247,9 +346,9 @@ class MultiHeadedAttention(tf.keras.layers.Layer):
 
 def get_model(model_name, embedding_size=128) -> tf.keras.models.Model:
   x = input = tf.keras.Input(shape=(224, 224, 3))
-  x = ImageTokenizer(16, embedding_size)(x)
-  for layer in range(4):
-    x = MultiHeadedAttention(embedding_size, 8)(x)
+  x = ImageTokenizer(8, embedding_size)(x)
+  for layer in range(6):
+    x = MultiHeadedAttention(embedding_size, 6)(x)
   x = tf.keras.layers.Flatten()(x)
   y = tf.keras.layers.Dense(10)(x)
 
@@ -268,7 +367,7 @@ def get_model(model_name, embedding_size=128) -> tf.keras.models.Model:
 
 
 def main():
-  train, val, test = get_ds(batch_size=512,
+  train, val, test = get_ds(batch_size=32,
                             train_per=85,
                             valid_per=15,
                             shape=(224, 224, 3))
