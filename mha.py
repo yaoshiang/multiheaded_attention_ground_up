@@ -116,16 +116,17 @@ def get_ds(batch_size, train_per, valid_per, shape=(224, 224, 3)):
   )
   dataset_valid = _alexnet_crop_valid_center(dataset_valid)
 
-  dataset_valid = dataset_valid.cache(
-      f"/tmp/cached_imagenette_valid_{valid_per}_alexnet")
+  # dataset_valid = dataset_valid.cache(
+  #     f"/tmp/cached_imagenette_valid_{valid_per}_alexnet")
 
-  dataset_train = dataset_train.batch(batch_size, drop_remainder=True)
-  dataset_valid = dataset_valid.batch(batch_size, drop_remainder=True)
+  dataset_train = dataset_train.batch(batch_size, drop_remainder=False)
+  dataset_valid = dataset_valid.batch(batch_size, drop_remainder=False)
 
   dataset_train = dataset_train.prefetch(AUTOTUNE)
   dataset_valid = dataset_valid.prefetch(AUTOTUNE)
 
   nvalid = len(dataset_valid)
+  assert nvalid >= 2
   dataset_test = dataset_valid.skip(nvalid // 2)
   dataset_valid = dataset_valid.take(nvalid // 2)
 
@@ -138,12 +139,14 @@ class ImageTokenizer(tf.keras.layers.Layer):
     super().__init__()
     self.P = patch_size
     self.token_length = token_length
-    self.dense = tf.keras.layers.Dense(token_length)
 
   def build(self, input_shape):
     self.B = input_shape[0]
     self.H = input_shape[1]
     self.W = input_shape[2]
+
+    self.embedding = tf.keras.layers.Dense(self.token_length)
+    self.positional = tf.keras.layers.Dense(self.token_length)
 
   @staticmethod
   def chip_image(image, B, H, W, P):
@@ -172,7 +175,7 @@ class ImageTokenizer(tf.keras.layers.Layer):
     image = tf.reshape(image, (-1, W // P, P, H // P, P, 3))
 
     # push the chips to the end of the axis. B, W//P, H//P, P, P, 3.
-    image = tf.transpose(image, (0, 1, 3, 4, 2, 5))
+    image = tf.transpose(image, (0, 3, 1, 4, 2, 5))
 
     return image
 
@@ -182,11 +185,17 @@ class ImageTokenizer(tf.keras.layers.Layer):
     num_chips = chips.shape[1] * chips.shape[2]
 
     # Turn the chips into tokens. B, H//P x W // P, P x P x 3.
-    image = tf.reshape(image, (-1, num_chips, self.P * self.P * 3))
+    tokens = tf.reshape(image, (-1, num_chips, self.P * self.P * 3))
 
-    tf.debugging.assert_equal(tf.shape(image)[2], 1024 * 3)
+    # BCL (Batch, Chips, token Length)
+    embedding = self.embedding(tokens)
 
-    return self.dense(image)
+    integer_positions = tf.range(num_chips)  # C
+    integer_positions = integer_positions[..., tf.newaxis]  # C1
+    positional_embedding = self.positional(integer_positions)  # CL
+
+    # BCL + CL -> BCL
+    return embedding + positional_embedding
 
 
 class MultiHeadedAttention(tf.keras.layers.Layer):
@@ -203,7 +212,7 @@ class MultiHeadedAttention(tf.keras.layers.Layer):
     self.layer_norm1 = tf.keras.layers.LayerNormalization()
     self.layer_norm2 = tf.keras.layers.LayerNormalization()
 
-    self.activation = tf.keras.layers.ReLU()
+    self.activation = tfa.layers.GELU()
 
   def build(self, input_shape):
     self.B = input_shape[0]
@@ -236,36 +245,38 @@ class MultiHeadedAttention(tf.keras.layers.Layer):
     return z
 
 
-def get_model(model_name) -> tf.keras.models.Model:
+def get_model(model_name, embedding_size=128) -> tf.keras.models.Model:
   x = input = tf.keras.Input(shape=(224, 224, 3))
-  x = ImageTokenizer(32, 256)(x)
+  x = ImageTokenizer(16, embedding_size)(x)
   for layer in range(4):
-    x = MultiHeadedAttention(256, 8)(x)
+    x = MultiHeadedAttention(embedding_size, 8)(x)
   x = tf.keras.layers.Flatten()(x)
   y = tf.keras.layers.Dense(10)(x)
+
   model = tf.keras.Model(inputs=input, outputs=y)
   model.build(input_shape=(None, 224, 224, 3))
   model.summary()
 
-  o = tfa.optimizers.LAMB(learning_rate=0.001)
+  o = tfa.optimizers.LAMB(weight_decay=1e-7)
 
   model.compile(
       optimizer=o,
       loss=tf.keras.losses.CategoricalCrossentropy(from_logits=True),
       metrics=[tf.keras.metrics.CategoricalAccuracy(name="acc")],
   )
-  model.optimizer.lr = 0.001
   return model
 
 
 def main():
-  train, val, test = get_ds(batch_size=64,
-                            train_per=90,
-                            valid_per=10,
+  train, val, test = get_ds(batch_size=512,
+                            train_per=85,
+                            valid_per=15,
                             shape=(224, 224, 3))
   model = get_model("test_model")
 
-  model.fit(train, epochs=10, validation_data=val)
+  rlr = tf.keras.callbacks.ReduceLROnPlateau()
+
+  model.fit(train, epochs=100, validation_data=val, callbacks=[rlr])
 
 
 if __name__ == '__main__':
