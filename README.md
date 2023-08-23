@@ -1,4 +1,4 @@
-Ground up implementation of attention module / transformer model based on the ConvNext paper, Jay Alammar's Illustrated Transformer and a quick reference to the Attention Is All You Need paper to understand the final feed forward layer in each Multi Headed Attention model since ConvNext mentioned it resembled a 1x1 Point Conv - mixing information between heads rather than across tokens. 
+Ground up implementation of attention module / transformer model (encoder only). I based this on a very light, purely conceptpual understanding of the ConvNext paper, Jay Alammar's Illustrated Transformer and a quick reference to the Attention Is All You Need paper to understand the final feed forward layer in each Multi Headed Attention model since ConvNext mentioned it resembled a 1x1 Point Conv - mixing information between heads rather than across tokens. I purposely did not attempt to implement the algorithm faithfully so that I could struggle with the same challenges and learn them myself the hard way. 
 
 Trains to 70% accuracy on Imagenette with very little hyperparameter or architecture tuning.
 
